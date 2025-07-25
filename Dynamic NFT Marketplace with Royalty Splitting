@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+
+/**
+ * @title Dynamic NFT Marketplace with Royalty Splitting
+ * @dev A comprehensive NFT marketplace that supports dynamic metadata updates and automatic royalty distribution
+ */
+contract Project is ERC721URIStorage, Ownable, ReentrancyGuard {
+    using Counters for Counters.Counter;
+    
+    Counters.Counter private _tokenIds;
+    
+    // Marketplace fee percentage (in basis points, e.g., 250 = 2.5%)
+    uint256 public marketplaceFee = 250;
+    
+    // Struct to store NFT listing information
+    struct Listing {
+        uint256 tokenId;
+        address seller;
+        uint256 price;
+        bool active;
+    }
+    
+    // Struct to store royalty information
+    struct RoyaltyInfo {
+        address[] recipients;
+        uint256[] percentages; // in basis points
+        uint256 totalPercentage;
+    }
+    
+    // Struct to store dynamic NFT metadata
+    struct DynamicMetadata {
+        string baseURI;
+        uint256 lastUpdate;
+        mapping(string => string) attributes;
+    }
+    
+    // Mappings
+    mapping(uint256 => Listing) public listings;
+    mapping(uint256 => RoyaltyInfo) public royalties;
+    mapping(uint256 => DynamicMetadata) private dynamicData;
+    mapping(uint256 => address) public creators;
+    
+    // Events
+    event NFTListed(uint256 indexed tokenId, address indexed seller, uint256 price);
+    event NFTSold(uint256 indexed tokenId, address indexed buyer, address indexed seller, uint256 price);
+    event RoyaltiesDistributed(uint256 indexed tokenId, uint256 totalAmount);
+    event MetadataUpdated(uint256 indexed tokenId, string newURI);
+    event ListingCancelled(uint256 indexed tokenId);
+    
+    constructor() ERC721("DynamicNFTMarketplace", "DNM") Ownable(msg.sender) {}
+    
+    /**
+     * @dev Core Function 1: Create and List NFT with Royalty Configuration
+     * @param to Address to mint the NFT to
+     * @param tokenURI Initial metadata URI for the NFT
+     * @param price Listing price for the NFT
+     * @param royaltyRecipients Array of addresses to receive royalties
+     * @param royaltyPercentages Array of percentages (in basis points) for each recipient
+     */
+    function createAndListNFT(
+        address to,
+        string memory tokenURI,
+        uint256 price,
+        address[] memory royaltyRecipients,
+        uint256[] memory royaltyPercentages
+    ) public returns (uint256) {
+        require(royaltyRecipients.length == royaltyPercentages.length, "Mismatched arrays");
+        require(price > 0, "Price must be greater than 0");
+        
+        // Calculate total royalty percentage
+        uint256 totalRoyalty = 0;
+        for (uint256 i = 0; i < royaltyPercentages.length; i++) {
+            totalRoyalty += royaltyPercentages[i];
+        }
+        require(totalRoyalty <= 5000, "Total royalty cannot exceed 50%"); // Max 50% royalty
+        
+        _tokenIds.increment();
+        uint256 newTokenId = _tokenIds.current();
+        
+        // Mint NFT
+        _mint(to, newTokenId);
+        _setTokenURI(newTokenId, tokenURI);
+        
+        // Set creator
+        creators[newTokenId] = msg.sender;
+        
+        // Configure royalties
+        royalties[newTokenId] = RoyaltyInfo({
+            recipients: royaltyRecipients,
+            percentages: royaltyPercentages,
+            totalPercentage: totalRoyalty
+        });
+        
+        // Initialize dynamic metadata
+        dynamicData[newTokenId].baseURI = tokenURI;
+        dynamicData[newTokenId].lastUpdate = block.timestamp;
+        
+        // Create listing
+        listings[newTokenId] = Listing({
+            tokenId: newTokenId,
+            seller: to,
+            price: price,
+            active: true
+        });
+        
+        emit NFTListed(newTokenId, to, price);
+        
+        return newTokenId;
+    }
+    
+    /**
+     * @dev Core Function 2: Purchase NFT with Automatic Royalty Distribution
+     * @param tokenId ID of the NFT to purchase
+     */
+    function purchaseNFT(uint256 tokenId) public payable nonReentrant {
+        Listing storage listing = listings[tokenId];
+        require(listing.active, "NFT not listed for sale");
+        require(msg.value >= listing.price, "Insufficient payment");
+        require(msg.sender != listing.seller, "Cannot buy your own NFT");
+        
+        address seller = listing.seller;
+        uint256 salePrice = listing.price;
+        
+        // Deactivate listing
+        listing.active = false;
+        
+        // Calculate fees and royalties
+        uint256 marketplaceFeeAmount = (salePrice * marketplaceFee) / 10000;
+        uint256 royaltyAmount = (salePrice * royalties[tokenId].totalPercentage) / 10000;
+        uint256 sellerAmount = salePrice - marketplaceFeeAmount - royaltyAmount;
+        
+        // Transfer NFT to buyer
+        _transfer(seller, msg.sender, tokenId);
+        
+        // Distribute payments
+        if (royaltyAmount > 0) {
+            _distributeRoyalties(tokenId, royaltyAmount);
+        }
+        
+        // Pay seller
+        if (sellerAmount > 0) {
+            payable(seller).transfer(sellerAmount);
+        }
+        
+        // Pay marketplace fee to owner
+        if (marketplaceFeeAmount > 0) {
+            payable(owner()).transfer(marketplaceFeeAmount);
+        }
+        
+        // Refund excess payment
+        if (msg.value > salePrice) {
+            payable(msg.sender).transfer(msg.value - salePrice);
+        }
+        
+        emit NFTSold(tokenId, msg.sender, seller, salePrice);
+    }
+    
+    /**
+     * @dev Core Function 3: Update Dynamic NFT Metadata
+     * @param tokenId ID of the NFT to update
+     * @param newURI New metadata URI
+     * @param attributeKeys Array of attribute keys to update
+     * @param attributeValues Array of attribute values to update
+     */
+    function updateDynamicMetadata(
+        uint256 tokenId,
+        string memory newURI,
+        string[] memory attributeKeys,
+        string[] memory attributeValues
+    ) public {
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        require(
+            msg.sender == creators[tokenId] || msg.sender == ownerOf(tokenId),
+            "Only creator or owner can update metadata"
+        );
+        require(attributeKeys.length == attributeValues.length, "Mismatched attribute arrays");
+        
+        // Update base URI
+        if (bytes(newURI).length > 0) {
+            _setTokenURI(tokenId, newURI);
+            dynamicData[tokenId].baseURI = newURI;
+        }
+        
+        // Update attributes
+        for (uint256 i = 0; i < attributeKeys.length; i++) {
+            dynamicData[tokenId].attributes[attributeKeys[i]] = attributeValues[i];
+        }
+        
+        // Update timestamp
+        dynamicData[tokenId].lastUpdate = block.timestamp;
+        
+        emit MetadataUpdated(tokenId, newURI);
+    }
+    
+    /**
+     * @dev Internal function to distribute royalties
+     * @param tokenId ID of the NFT
+     * @param totalRoyalty Total royalty amount to distribute
+     */
+    function _distributeRoyalties(uint256 tokenId, uint256 totalRoyalty) internal {
+        RoyaltyInfo storage royaltyInfo = royalties[tokenId];
+        
+        for (uint256 i = 0; i < royaltyInfo.recipients.length; i++) {
+            uint256 recipientAmount = (totalRoyalty * royaltyInfo.percentages[i]) / royaltyInfo.totalPercentage;
+            if (recipientAmount > 0) {
+                payable(royaltyInfo.recipients[i]).transfer(recipientAmount);
+            }
+        }
+        
+        emit RoyaltiesDistributed(tokenId, totalRoyalty);
+    }
+    
+    /**
+     * @dev Cancel NFT listing
+     * @param tokenId ID of the NFT to cancel listing
+     */
+    function cancelListing(uint256 tokenId) public {
+        require(listings[tokenId].seller == msg.sender, "Only seller can cancel listing");
+        require(listings[tokenId].active, "Listing not active");
+        
+        listings[tokenId].active = false;
+        emit ListingCancelled(tokenId);
+    }
+    
+    /**
+     * @dev Get dynamic attribute value
+     * @param tokenId ID of the NFT
+     * @param attributeKey Key of the attribute
+     */
+    function getDynamicAttribute(uint256 tokenId, string memory attributeKey) 
+        public view returns (string memory) {
+        return dynamicData[tokenId].attributes[attributeKey];
+    }
+    
+    /**
+     * @dev Get NFT metadata last update timestamp
+     * @param tokenId ID of the NFT
+     */
+    function getLastUpdateTime(uint256 tokenId) public view returns (uint256) {
+        return dynamicData[tokenId].lastUpdate;
+    }
+    
+    /**
+     * @dev Update marketplace fee (only owner)
+     * @param newFee New fee percentage in basis points
+     */
+    function updateMarketplaceFee(uint256 newFee) public onlyOwner {
+        require(newFee <= 1000, "Fee cannot exceed 10%");
+        marketplaceFee = newFee;
+    }
+    
+    /**
+     * @dev Withdraw contract balance (only owner)
+     */
+    function withdraw() public onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds to withdraw");
+        payable(owner()).transfer(balance);
+    }
+    
+    /**
+     * @dev Check if a token exists
+     * @param tokenId ID of the token to check
+     */
+    function tokenExists(uint256 tokenId) public view returns (bool) {
+        return _ownerOf(tokenId) != address(0);
+    }
+    
+    /**
+     * @dev Get total number of minted tokens
+     */
+    function totalSupply() public view returns (uint256) {
+        return _tokenIds.current();
+    }
+}
